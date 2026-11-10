@@ -10,6 +10,11 @@ SITE_FILE="${SITE_FILE:-/etc/apache2/sites-available/$PUBLIC_HOST.conf}"
 SNIPPET_FILE="${SNIPPET_FILE:-/etc/apache2/pho.conf}"
 CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"
 ALLOW_INDEX="${ALLOW_INDEX:-0}"
+# Address in <VirtualHost ADDR:port>. "auto" uses the IP the other vhosts are bound to
+# (on nuc they are written <VirtualHost www.parnes.com:443>, which resolves to 192.168.2.80).
+# Apache always prefers vhosts bound to an IP over *:port ones, so a *:443 vhost would never
+# be chosen there.
+VHOST_ADDR="${VHOST_ADDR:-auto}"
 CHECK_ONLY=false
 ROLLBACK=false
 SKIP_APACHE=false
@@ -68,6 +73,12 @@ host_vhosts() {
   done | sort -u
   return 0
 }
+# The IPv4 address other name-based vhosts are bound to, or * if they use *:port.
+detect_vhost_addr() {
+  local addr
+  addr="$(apache2ctl -S 2>/dev/null | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:(443|80)$/ { sub(/:[0-9]+$/, "", $1); print $1; exit }')" || true
+  echo "${addr:-*}"
+}
 ssl_vhost_exists() {
   local f
   for f in $(host_vhosts); do grep -Eq '<VirtualHost[^>]*:443' "$f" && return 0; done
@@ -79,6 +90,10 @@ validate() {
   [[ "$DOCUMENT_ROOT" == /* && "$DOCUMENT_ROOT" != "/" && "$DOCUMENT_ROOT" != */ ]] || die "DOCUMENT_ROOT måste vara en absolut sökväg utan avslutande snedstreck."
   [[ "$SITE_FILE" == /etc/apache2/sites-available/*.conf ]] || die "SITE_FILE måste ligga i /etc/apache2/sites-available/ och sluta på .conf."
   [[ "$SNIPPET_FILE" == /etc/apache2/* ]] || die "SNIPPET_FILE måste ligga i /etc/apache2/."
+  if ! $SKIP_APACHE && command -v apache2ctl >/dev/null 2>&1 && [[ "$VHOST_ADDR" == auto ]]; then
+    VHOST_ADDR="$(detect_vhost_addr)"
+  fi
+  [[ "$VHOST_ADDR" == "*" || "$VHOST_ADDR" == auto || "$VHOST_ADDR" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "VHOST_ADDR måste vara *, auto eller en IPv4-adress."
   [[ -f "$REPO_DIR/src/web/index.html" ]] || die "Hittar inte Pho i $REPO_DIR (src/web/index.html saknas)."
   [[ -x "$HERE/build.sh" ]] || die "deploy/build.sh saknas eller är inte körbar."
   [[ -d "$(dirname "$DOCUMENT_ROOT")" ]] || die "Katalogen för DocumentRoot saknas: $(dirname "$DOCUMENT_ROOT")"
@@ -104,11 +119,12 @@ validate() {
 }
 
 verify() {
-  local base="$1" body
-  body="$(curl -fsS --noproxy "*" --max-time 15 --resolve "$PUBLIC_HOST:443:127.0.0.1" "$base/")" || return 1
+  local base="$1" body ip=127.0.0.1
+  [[ "$VHOST_ADDR" =~ ^[0-9.]+$ ]] && ip="$VHOST_ADDR"
+  body="$(curl -fsS --noproxy "*" --max-time 15 --resolve "$PUBLIC_HOST:443:$ip" "$base/")" || return 1
   grep -q '<title>Phomymo' <<<"$body" || return 1
-  curl -fsS --noproxy "*" --max-time 15 --resolve "$PUBLIC_HOST:443:127.0.0.1" "$base/printers.json" | head -c 1 | grep -q '[{[]' || return 1
-  curl -fsS --noproxy "*" --max-time 15 --resolve "$PUBLIC_HOST:443:127.0.0.1" "$base/version.json"
+  curl -fsS --noproxy "*" --max-time 15 --resolve "$PUBLIC_HOST:443:$ip" "$base/printers.json" | head -c 1 | grep -q '[{[]' || return 1
+  curl -fsS --noproxy "*" --max-time 15 --resolve "$PUBLIC_HOST:443:$ip" "$base/version.json"
 }
 
 if [[ $EUID -ne 0 ]] && ! $CHECK_ONLY; then die "Kör med sudo."; fi
@@ -118,9 +134,14 @@ if $CHECK_ONLY; then
   info "Repo:          $REPO_DIR"
   info "Publik adress: $PUBLIC_URL"
   info "DocumentRoot:  $DOCUMENT_ROOT"
+  $SKIP_APACHE || info "Vhost-adress:  $VHOST_ADDR"
   if ! $SKIP_APACHE; then
     vhosts="$(host_vhosts)"
     if [[ -n "$vhosts" ]]; then info "Befintliga vhostar för $PUBLIC_HOST:"; while read -r v; do echo "      $v"; done <<<"$vhosts"
+      # shellcheck disable=SC2086 # one file per word
+      if [[ "$VHOST_ADDR" != "*" ]] && grep -Eq '<VirtualHost \*:(80|443)>' $vhosts; then
+        info "Vhostarna använder *:port och flyttas till $VHOST_ADDR vid installationen."
+      fi
     else info "Ingen vhost för $PUBLIC_HOST ännu; skapas i $SITE_FILE och certbot hämtar certifikat."
     fi
   fi
@@ -185,7 +206,7 @@ if ! $SKIP_APACHE; then
     cat >"$SITE_FILE" <<EOF
 # Pho (Phomymo). Written by deploy/install.sh. certbot adds the HTTPS copy
 # ($(basename "${SITE_FILE%.conf}")-le-ssl.conf) and the redirect from http.
-<VirtualHost *:80>
+<VirtualHost $VHOST_ADDR:80>
     ServerName $PUBLIC_HOST
     DocumentRoot $DOCUMENT_ROOT
     $include_line
@@ -197,12 +218,19 @@ EOF
     a2ensite "$(basename "$SITE_FILE" .conf)" >/dev/null
   fi
 
-  # Every vhost for the host includes the snippet (also ones made earlier by hand).
+  # Every vhost for the host includes the snippet (also ones made earlier by hand) and is bound
+  # to the same address as the server's other vhosts.
   for f in $(host_vhosts); do
-    grep -Fq "$include_line" "$f" && continue
-    info "Lägger till '$include_line' i $f"
-    backup "$f"
-    sed -i "0,/<\/VirtualHost>/s##    $include_line\n</VirtualHost>#" "$f"
+    if ! grep -Fq "$include_line" "$f"; then
+      info "Lägger till '$include_line' i $f"
+      [[ -e "$backup_root/$(echo "$f" | tr / _)" ]] || backup "$f"
+      sed -i "0,/<\/VirtualHost>/s##    $include_line\n</VirtualHost>#" "$f"
+    fi
+    if [[ "$VHOST_ADDR" != "*" ]] && grep -Eq '<VirtualHost \*:(80|443)>' "$f"; then
+      info "Binder vhosten i $f till $VHOST_ADDR (som serverns övriga vhostar)"
+      [[ -e "$backup_root/$(echo "$f" | tr / _)" ]] || backup "$f"
+      sed -Ei "s#<VirtualHost \*:(80|443)>#<VirtualHost $VHOST_ADDR:\1>#" "$f"
+    fi
   done
 
   if ! apache2ctl configtest; then restore_apache; die "apache2ctl configtest misslyckades."; fi
@@ -224,7 +252,7 @@ if version="$(verify "$PUBLIC_URL")"; then
   info "Klart. Publicerad version: $version"
   info "Öppna $PUBLIC_URL i Chrome eller Edge. Återställ med: sudo ./deploy/install.sh --rollback"
 else
-  warn "Sidan svarade inte som väntat via https://$PUBLIC_HOST på den här maskinen."
+  warn "Sidan svarade inte som väntat via https://$PUBLIC_HOST (kontrollerat mot $( [[ "$VHOST_ADDR" =~ ^[0-9.]+$ ]] && echo "$VHOST_ADDR" || echo 127.0.0.1)). Se 'sudo apache2ctl -S'."
   warn "Filerna är publicerade; kontrollera Apache-loggarna. Föregående version: sudo ./deploy/install.sh --rollback"
   exit 1
 fi

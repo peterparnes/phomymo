@@ -31,6 +31,8 @@ Första gången gör skriptet följande:
 
 Om det redan finns en vhost för namnet lägger skriptet bara till `Include /etc/apache2/pho.conf` i den.
 
+På nuc är alla vhostar bundna till en IP-adress (`<VirtualHost www.parnes.com:443>` slås upp till 192.168.2.80). Apache väljer alltid en sådan vhost före en `*:443`-vhost, så skriptet läser adressen från `apache2ctl -S` och binder Pho:s vhostar till samma adress. Det gäller även vhostar som tidigare skapats med `*`. Slutkontrollen görs mot samma adress och kontrollerar certifikatet.
+
 ## Uppdatera
 
 ```bash
@@ -86,6 +88,7 @@ Alla standardvärden finns högst upp i `deploy/install.sh` och kan ändras med 
 | `SNIPPET_FILE` | `/etc/apache2/pho.conf` |
 | `CERTBOT_EMAIL` | tomt (certbot använder sitt befintliga konto) |
 | `ALLOW_INDEX` | `0` |
+| `VHOST_ADDR` | `auto`: samma IP-adress som serverns övriga vhostar (192.168.2.80 på nuc), annars `*` |
 
 Skriptet vägrar skriva över en DocumentRoot som det inte själv har publicerat. Det känner igen sina egna kataloger på filen `.pho-deploy`.
 
