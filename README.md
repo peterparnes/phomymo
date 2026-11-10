@@ -25,6 +25,10 @@ python3 -m http.server 8080
 
 **Requires:** Chrome, Edge, or another Chromium-based browser. Web Bluetooth is not available in Firefox or Safari. Android Chrome is supported with full touch UI; iOS is not supported. PM-241 printers require USB (WebUSB).
 
+### Self-hosting on Apache
+
+This fork is deployed to https://phomymo.parnes.com with `sudo ./deploy/install.sh` (Apache + certbot). See [deploy/README.md](deploy/README.md) (Swedish).
+
 ## Features
 
 **Design Elements** - Text (multiple fonts including local system fonts, sizes, styles, alignment, background colors), images with scale/aspect lock, barcodes (Code128, EAN-13, UPC-A, Code39), QR codes, and shapes (rectangle, ellipse, triangle, line) with solid, dithered grayscale, and stroke fills.
