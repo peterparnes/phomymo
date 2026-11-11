@@ -88,8 +88,11 @@ ssl_vhost_exists() {
 validate() {
   [[ "$PUBLIC_HOST" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] || die "PUBLIC_HOST är inte ett giltigt värdnamn: $PUBLIC_HOST"
   [[ "$DOCUMENT_ROOT" == /* && "$DOCUMENT_ROOT" != "/" && "$DOCUMENT_ROOT" != */ ]] || die "DOCUMENT_ROOT måste vara en absolut sökväg utan avslutande snedstreck."
-  [[ "$SITE_FILE" == /etc/apache2/sites-available/*.conf ]] || die "SITE_FILE måste ligga i /etc/apache2/sites-available/ och sluta på .conf."
-  [[ "$SNIPPET_FILE" == /etc/apache2/* ]] || die "SNIPPET_FILE måste ligga i /etc/apache2/."
+  # The path is written into Apache config and sed expressions: keep it to plain characters.
+  [[ "$DOCUMENT_ROOT" =~ ^(/[A-Za-z0-9._-]+)+$ && "/$DOCUMENT_ROOT/" != */../* && "/$DOCUMENT_ROOT/" != */./* ]] \
+    || die "DOCUMENT_ROOT får bara innehålla A-Z, a-z, 0-9, punkt, bindestreck, understreck och snedstreck."
+  [[ "$SITE_FILE" =~ ^/etc/apache2/sites-available/[A-Za-z0-9._-]+\.conf$ ]] || die "SITE_FILE måste vara en fil direkt i /etc/apache2/sites-available/ och sluta på .conf."
+  [[ "$SNIPPET_FILE" =~ ^/etc/apache2/[A-Za-z0-9._-]+$ ]] || die "SNIPPET_FILE måste vara en fil direkt i /etc/apache2/."
   if ! $SKIP_APACHE && command -v apache2ctl >/dev/null 2>&1 && [[ "$VHOST_ADDR" == auto ]]; then
     VHOST_ADDR="$(detect_vhost_addr)"
   fi
@@ -97,10 +100,19 @@ validate() {
   [[ -f "$REPO_DIR/src/web/index.html" ]] || die "Hittar inte Pho i $REPO_DIR (src/web/index.html saknas)."
   [[ -x "$HERE/build.sh" ]] || die "deploy/build.sh saknas eller är inte körbar."
   [[ -d "$(dirname "$DOCUMENT_ROOT")" ]] || die "Katalogen för DocumentRoot saknas: $(dirname "$DOCUMENT_ROOT")"
-  # Never replace a directory someone else put there.
-  if [[ -d "$DOCUMENT_ROOT" && ! -f "$DOCUMENT_ROOT/$MARKER" && -n "$(ls -A "$DOCUMENT_ROOT")" ]]; then
-    die "$DOCUMENT_ROOT finns redan och har inte publicerats av detta skript. Flytta undan den eller ange DOCUMENT_ROOT=..."
-  fi
+  # Never replace or delete a directory someone else put there.
+  local d
+  for d in "$DOCUMENT_ROOT" "$NEW_DIR" "$PREV_DIR"; do
+    if [[ -L "$d" ]] || [[ -e "$d" && ! -d "$d" ]]; then
+      die "$d är inte en vanlig katalog. Flytta undan den."
+    fi
+    if [[ -d "$d" && ! -f "$d/$MARKER" && -n "$(ls -A "$d")" ]]; then
+      die "$d finns redan och har inte publicerats av detta skript. Flytta undan den eller ange DOCUMENT_ROOT=..."
+    fi
+  done
+  BUILD_USER="$(stat -c %U "$REPO_DIR")"
+  need_command runuser
+  need_command stat
   need_command curl
   need_command sed
   need_command find
@@ -124,6 +136,12 @@ verify() {
   body="$(curl -fsS --noproxy "*" --max-time 15 --resolve "$PUBLIC_HOST:443:$ip" "$base/")" || return 1
   grep -q '<title>Phomymo' <<<"$body" || return 1
   curl -fsS --noproxy "*" --max-time 15 --resolve "$PUBLIC_HOST:443:$ip" "$base/printers.json" | head -c 1 | grep -q '[{[]' || return 1
+  # The security snippet must be active for this vhost: its headers are present and the deploy
+  # marker (a dotfile) is denied.
+  curl -fsS -o /dev/null -D - --noproxy "*" --max-time 15 --resolve "$PUBLIC_HOST:443:$ip" "$base/" \
+    | grep -qi '^X-Content-Type-Options: nosniff' || { echo "säkerhetshuvudena saknas" >&2; return 1; }
+  [[ "$(curl -s -o /dev/null -w '%{http_code}' --noproxy "*" --max-time 15 --resolve "$PUBLIC_HOST:443:$ip" "$base/$MARKER")" == 403 ]] \
+    || { echo "dolda filer nekas inte" >&2; return 1; }
   curl -fsS --noproxy "*" --max-time 15 --resolve "$PUBLIC_HOST:443:$ip" "$base/version.json"
 }
 
@@ -152,6 +170,7 @@ fi
 # --- Files -----------------------------------------------------------------------------------
 if $ROLLBACK; then
   [[ -f "$PREV_DIR/$MARKER" ]] || die "Det finns ingen föregående version i $PREV_DIR."
+  [[ ! -e "$NEW_DIR" ]] || rm -rf "$NEW_DIR"   # validate() checked it is ours
   info "Byter tillbaka till föregående version"
   mv "$DOCUMENT_ROOT" "$NEW_DIR"
   mv "$PREV_DIR" "$DOCUMENT_ROOT"
@@ -160,11 +179,22 @@ if $ROLLBACK; then
   exit 0
 fi
 
-info "Bygger Pho"
-rm -rf "$NEW_DIR"
-REPO_DIR="$REPO_DIR" ALLOW_INDEX="$ALLOW_INDEX" "$HERE/build.sh" "$NEW_DIR" "$PUBLIC_URL"
+# The build runs as the checkout owner, not as root: it reads only what that user can read, and
+# nothing in the checkout (merged from upstream) can make root read or write other files.
+info "Bygger Pho som $BUILD_USER"
+build_tmp="$(runuser -u "$BUILD_USER" -- mktemp -d)"
+trap 'rm -rf "$build_tmp"' EXIT
+runuser -u "$BUILD_USER" -- env -i PATH="/usr/local/bin:/usr/bin:/bin" HOME="$build_tmp" LANG=C.UTF-8 \
+  REPO_DIR="$REPO_DIR" ALLOW_INDEX="$ALLOW_INDEX" "$HERE/build.sh" "$build_tmp/out" "$PUBLIC_URL"
+bad="$(find "$build_tmp/out" -mindepth 1 ! -type f ! -type d -print -quit)"
+[[ -z "$bad" ]] || die "Bygget innehåller något annat än vanliga filer: $bad"
+rm -rf "$NEW_DIR"   # validate() checked it is ours
+mkdir -m 755 "$NEW_DIR"
+cp -R --no-preserve=all "$build_tmp/out/." "$NEW_DIR/"
 touch "$NEW_DIR/$MARKER"
 chown -R root:root "$NEW_DIR"
+find "$NEW_DIR" -type d -exec chmod 755 {} +
+find "$NEW_DIR" -type f -exec chmod 644 {} +
 
 info "Publicerar till $DOCUMENT_ROOT (föregående version sparas i $PREV_DIR)"
 if [[ -d "$DOCUMENT_ROOT" ]]; then
@@ -221,7 +251,12 @@ EOF
   # Every vhost for the host includes the snippet (also ones made earlier by hand) and is bound
   # to the same address as the server's other vhosts.
   for f in $(host_vhosts); do
-    if ! grep -Fq "$include_line" "$f"; then
+    # Edits below work on the whole file, so the file must hold only this site's vhost.
+    if (( $(grep -Eic '^[[:space:]]*<VirtualHost[[:space:]]' "$f") != 1 )); then
+      restore_apache
+      die "$f innehåller flera <VirtualHost>-block. Lägg vhosten för $PUBLIC_HOST i en egen fil."
+    fi
+    if ! grep -Eq "^[[:space:]]*Include[[:space:]]+${SNIPPET_FILE//./\\.}[[:space:]]*$" "$f"; then
       info "Lägger till '$include_line' i $f"
       [[ -e "$backup_root/$(echo "$f" | tr / _)" ]] || backup "$f"
       sed -i "0,/<\/VirtualHost>/s##    $include_line\n</VirtualHost>#" "$f"

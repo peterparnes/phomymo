@@ -4,11 +4,12 @@
  * v116
  */
 
-import { CanvasRenderer } from './canvas.js?v=115';
+import { CanvasRenderer } from './canvas.js?v=116';
 import { BLETransport } from './ble.js?v=103';
 import { USBTransport } from './usb.js?v=101';
 import { print, printDensityTest, isDSeriesPrinter, isP12Printer, isA30Printer, isTapePrinter, isPM241Printer, isTSPLPrinter, isRotatedPrinter, getPrinterWidthBytes, getPrinterDpi, getPrinterAlignment, getPrinterDescription, isDeviceRecognized, getMatchedPattern, loadPrinterDefinitions, getAllPrinterDefinitions, getPrinterDefinition, getCustomPrinterDefinitions, saveCustomPrinterDefinition, deleteCustomPrinterDefinition, isBuiltinPrinter, resetBuiltinPrinter, getAvailableProtocols, getAvailableLabelPresets, getDetectedDefinition } from './printer.js?v=128';
 import {
+  generateId,
   createTextElement,
   createImageElement,
   createBarcodeElement,
@@ -1351,10 +1352,81 @@ function toggleTemplatePanel() {
 /**
  * Escape HTML for safe insertion
  */
+// Escape a value for HTML text and for double- or single-quoted attributes.
 function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+  return String(str ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+// A finite number for HTML interpolation, or the fallback.
+function num(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+// Numeric element properties that the UI interpolates into markup or uses for layout.
+const NUMERIC_ELEMENT_PROPS = [
+  'x', 'y', 'width', 'height', 'rotation', 'fontSize', 'textFontSize',
+  'strokeWidth', 'cornerRadius', 'brightness', 'contrast',
+];
+const SAFE_ELEMENT_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * Validate design data from an imported file or from localStorage before it enters state.
+ * Designs are shared as files, so every field is untrusted.
+ * Returns { elements, labelSize, templateData } or throws on an unusable design.
+ */
+function sanitizeDesignData(data) {
+  if (!data || typeof data !== 'object' || !Array.isArray(data.elements)) {
+    throw new Error('Invalid design file: missing elements');
+  }
+  const ids = new Map();
+  const elements = data.elements
+    .filter(el => el && typeof el === 'object' && !Array.isArray(el) && typeof el.type === 'string')
+    .map(el => {
+      const clean = { ...el };
+      if (typeof clean.id !== 'string' || !SAFE_ELEMENT_ID.test(clean.id)) {
+        const fresh = generateId();
+        if (clean.id !== undefined) ids.set(String(clean.id), fresh);
+        clean.id = fresh;
+      }
+      for (const prop of NUMERIC_ELEMENT_PROPS) {
+        if (prop in clean) {
+          const n = Number(clean[prop]);
+          if (Number.isFinite(n)) clean[prop] = n; else delete clean[prop];
+        }
+      }
+      // Only embedded images: a remote URL would make the browser fetch it.
+      if ('imageData' in clean && !(typeof clean.imageData === 'string' && clean.imageData.startsWith('data:image/'))) {
+        delete clean.imageData;
+      }
+      return clean;
+    });
+  // Keep groups intact when ids had to be replaced.
+  for (const el of elements) {
+    if (el.groupId !== undefined && typeof el.groupId !== 'string') delete el.groupId;
+    if (typeof el.groupId === 'string' && ids.has(el.groupId)) el.groupId = ids.get(el.groupId);
+  }
+
+  let labelSize = null;
+  if (data.labelSize) {
+    const width = Number(data.labelSize.width);
+    const height = Number(data.labelSize.height);
+    if (!(width > 0 && width < 10000 && height > 0 && height < 10000)) {
+      throw new Error('Invalid design file: bad label size');
+    }
+    labelSize = { ...data.labelSize, width, height, round: !!data.labelSize.round };
+  }
+
+  let templateData = null;
+  if (Array.isArray(data.templateData)) {
+    templateData = data.templateData
+      .filter(r => r && typeof r === 'object' && !Array.isArray(r))
+      .map(r => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v == null ? '' : String(v)])));
+  }
+
+  return { elements, labelSize, templateData };
 }
 
 /**
@@ -4924,19 +4996,19 @@ function showLoadDialog() {
         badges.push(`<span class="px-1.5 py-0.5 text-xs bg-green-100 text-green-700 rounded">${d.templateDataCount} records</span>`);
       }
       if (d.isMultiLabel) {
-        badges.push(`<span class="px-1.5 py-0.5 text-xs bg-orange-100 text-orange-700 rounded">${d.multiLabel.labelsAcross}-up</span>`);
+        badges.push(`<span class="px-1.5 py-0.5 text-xs bg-orange-100 text-orange-700 rounded">${num(d.multiLabel.labelsAcross)}-up</span>`);
       }
 
       const badgeHtml = badges.length > 0 ? `<div class="flex gap-1 mt-1">${badges.join('')}</div>` : '';
 
       return `
-        <div class="design-item flex items-center justify-between p-3 hover:bg-gray-50 rounded-lg cursor-pointer border border-gray-100 mb-2" data-name="${d.name}">
+        <div class="design-item flex items-center justify-between p-3 hover:bg-gray-50 rounded-lg cursor-pointer border border-gray-100 mb-2" data-name="${escapeHtml(d.name)}">
           <div class="flex-1">
-            <div class="font-medium text-sm text-gray-900">${d.name}</div>
-            <div class="text-xs text-gray-400">${d.labelSize.width}x${d.labelSize.height}mm · ${d.elementCount} elements</div>
+            <div class="font-medium text-sm text-gray-900">${escapeHtml(d.name)}</div>
+            <div class="text-xs text-gray-400">${num(d.labelSize?.width)}x${num(d.labelSize?.height)}mm · ${num(d.elementCount)} elements</div>
             ${badgeHtml}
           </div>
-          <button class="delete-design text-red-500 hover:text-red-700 text-xs px-2 py-1 ml-2" data-name="${d.name}">Delete</button>
+          <button class="delete-design text-red-500 hover:text-red-700 text-xs px-2 py-1 ml-2" data-name="${escapeHtml(d.name)}">Delete</button>
         </div>
       `;
     }).join('');
@@ -5122,12 +5194,9 @@ function handleImportFile(file) {
   const reader = new FileReader();
   reader.onload = (e) => {
     try {
-      const data = JSON.parse(e.target.result);
-
-      // Validate the data
-      if (!data.elements || !Array.isArray(data.elements)) {
-        throw new Error('Invalid design file: missing elements');
-      }
+      const raw = JSON.parse(e.target.result);
+      const clean = sanitizeDesignData(raw);
+      const data = { ...raw, ...clean };
 
       // Load the design
       state.elements = data.elements;
@@ -5152,7 +5221,7 @@ function handleImportFile(file) {
       }
 
       // Load template data if present
-      if (data.templateData && Array.isArray(data.templateData)) {
+      if (data.templateData) {
         state.templateData = data.templateData;
         state.selectedRecords = data.templateData.map((_, i) => i); // Select all by default
       }
@@ -5172,7 +5241,7 @@ function handleImportFile(file) {
       render();
       hideLoadDialog();
 
-      const name = data.name || 'Imported design';
+      const name = typeof data.name === 'string' && data.name ? data.name : 'Imported design';
       state.currentDesignName = name;
       updateMobileLabelName();
       setStatus(`Imported: ${name}`);
@@ -5204,7 +5273,7 @@ function updateElementsList() {
 
     return `
       <button class="element-list-item w-full px-3 py-1.5 text-left hover:bg-gray-100 flex items-center gap-2 ${isSelected ? 'bg-blue-50 text-blue-700' : ''}"
-              data-element-id="${el.id}">
+              data-element-id="${escapeHtml(el.id)}">
         <span class="text-gray-400 text-xs w-4">${layerNum}</span>
         ${icon}
         <span class="flex-1 truncate">${escapeHtml(label)}</span>
@@ -5270,12 +5339,22 @@ function handleLoad(name) {
     return;
   }
 
-  state.elements = design.elements || [];
-  state.labelSize = design.labelSize || { width: 40, height: 30 };
+  // Designs saved before validation existed may hold imported values; check them again.
+  let clean;
+  try {
+    clean = sanitizeDesignData({ ...design, elements: design.elements || [] });
+  } catch (err) {
+    logError(err, 'loadDesign');
+    setStatus(`Load failed: ${err.message}`);
+    return;
+  }
+
+  state.elements = clean.elements;
+  state.labelSize = clean.labelSize || { width: 40, height: 30 };
   state.selectedIds = [];
 
   // Restore template data if present
-  state.templateData = design.templateData || [];
+  state.templateData = clean.templateData || [];
   state.selectedRecords = state.templateData.map((_, i) => i); // Select all by default
 
   // Restore multi-label config if present
@@ -6112,7 +6191,7 @@ function populateMobileProps() {
   const fieldDropdownHtml = (inputId) => {
     const existingFields = state.templateFields || [];
     const fieldOptions = existingFields.map(f =>
-      `<button class="w-full px-3 py-2 text-left text-sm hover:bg-purple-50 active:bg-purple-100" data-insert-field="${f}" data-target="${inputId}">{{${escapeHtml(f)}}}</button>`
+      `<button class="w-full px-3 py-2 text-left text-sm hover:bg-purple-50 active:bg-purple-100" data-insert-field="${escapeHtml(f)}" data-target="${escapeHtml(inputId)}">{{${escapeHtml(f)}}}</button>`
     ).join('');
     return `
       <div class="mobile-field-dropdown hidden absolute right-0 top-full mt-1 bg-white border border-gray-200 rounded-lg shadow-lg z-[80] min-w-[160px] overflow-hidden">
@@ -6165,7 +6244,7 @@ function populateMobileProps() {
               </optgroup>
               ${state.localFonts.length > 0 ? `
               <optgroup label="System Fonts">
-                ${state.localFonts.map(f => `<option value="${f.family}" ${fontFamily === f.family ? 'selected' : ''}>${f.family}</option>`).join('')}
+                ${state.localFonts.map(f => `<option value="${escapeHtml(f.family)}" ${fontFamily === f.family ? 'selected' : ''}>${escapeHtml(f.family)}</option>`).join('')}
               </optgroup>
               ` : ''}
             </select>
@@ -6175,7 +6254,7 @@ function populateMobileProps() {
           </div>
           <div class="w-20">
             <div class="prop-label">Size</div>
-            <input type="number" id="mobile-prop-fontSize" class="prop-input" value="${selected.fontSize || 24}" min="8" max="200">
+            <input type="number" id="mobile-prop-fontSize" class="prop-input" value="${num(selected.fontSize, 24) || 24}" min="8" max="200">
           </div>
         </div>
       </div>
@@ -6283,7 +6362,7 @@ function populateMobileProps() {
         <div class="flex items-center gap-3">
           <div class="flex items-center gap-2">
             <label class="text-sm text-gray-600">Size:</label>
-            <input type="number" id="mobile-prop-textFontSize" class="w-16 px-2 py-1.5 text-sm border border-gray-200 rounded" value="${selected.textFontSize || 12}">
+            <input type="number" id="mobile-prop-textFontSize" class="w-16 px-2 py-1.5 text-sm border border-gray-200 rounded" value="${num(selected.textFontSize, 12) || 12}">
           </div>
           <label class="flex items-center gap-2">
             <input type="checkbox" id="mobile-prop-textBold" class="w-5 h-5" ${selected.textBold ? 'checked' : ''}>
@@ -6347,12 +6426,12 @@ function populateMobileProps() {
       </div>
       <div class="prop-group">
         <div class="prop-label">Stroke Width</div>
-        <input type="number" id="mobile-prop-strokeWidth" class="prop-input" value="${selected.strokeWidth || 2}" min="1" max="20">
+        <input type="number" id="mobile-prop-strokeWidth" class="prop-input" value="${num(selected.strokeWidth, 2) || 2}" min="1" max="20">
       </div>
       ${shapeType === 'rectangle' ? `
       <div class="prop-group">
         <div class="prop-label">Corner Radius</div>
-        <input type="number" id="mobile-prop-cornerRadius" class="prop-input" value="${selected.cornerRadius || 0}" min="0" max="100">
+        <input type="number" id="mobile-prop-cornerRadius" class="prop-input" value="${num(selected.cornerRadius, 0) || 0}" min="0" max="100">
       </div>
       ` : ''}
     `;
@@ -6382,11 +6461,11 @@ function populateMobileProps() {
       </div>
       <div class="prop-group">
         <div class="prop-label">Brightness</div>
-        <input type="range" id="mobile-prop-brightness" class="w-full" min="-100" max="100" value="${selected.brightness || 0}">
+        <input type="range" id="mobile-prop-brightness" class="w-full" min="-100" max="100" value="${num(selected.brightness, 0) || 0}">
       </div>
       <div class="prop-group">
         <div class="prop-label">Contrast</div>
-        <input type="range" id="mobile-prop-contrast" class="w-full" min="-100" max="100" value="${selected.contrast || 0}">
+        <input type="range" id="mobile-prop-contrast" class="w-full" min="-100" max="100" value="${num(selected.contrast, 0) || 0}">
       </div>
     `;
   }
@@ -6423,7 +6502,7 @@ function populateMobileProps() {
         <div class="prop-row">
           <div class="flex-1">
             <label class="text-xs text-gray-500">Rotation</label>
-            <input type="number" id="mobile-prop-rotation" class="prop-input" value="${selected.rotation || 0}" min="0" max="360">
+            <input type="number" id="mobile-prop-rotation" class="prop-input" value="${num(selected.rotation, 0) || 0}" min="0" max="360">
           </div>
           <div class="flex-1"></div>
         </div>
@@ -6899,13 +6978,13 @@ function initPrinterDefsManager() {
 
       row.innerHTML = `
         <div class="flex-1 min-w-0">
-          <div class="text-sm font-medium text-gray-800 truncate">${def.name}${badge}</div>
-          <div class="text-xs text-gray-400 truncate">${def.description || def.protocol}</div>
+          <div class="text-sm font-medium text-gray-800 truncate">${escapeHtml(def.name)}${badge}</div>
+          <div class="text-xs text-gray-400 truncate">${escapeHtml(def.description || def.protocol)}</div>
         </div>
         <div class="flex gap-1 ml-2 shrink-0">
-          <button class="pdef-edit-btn text-xs px-2 py-1 text-blue-600 hover:bg-blue-50 rounded" data-id="${def.id}">Edit</button>
-          ${isUserCreated ? `<button class="pdef-delete-btn text-xs px-2 py-1 text-red-600 hover:bg-red-50 rounded" data-id="${def.id}">Delete</button>` : ''}
-          ${isCustomized ? `<button class="pdef-reset-btn text-xs px-2 py-1 text-amber-600 hover:bg-amber-50 rounded" data-id="${def.id}">Reset</button>` : ''}
+          <button class="pdef-edit-btn text-xs px-2 py-1 text-blue-600 hover:bg-blue-50 rounded" data-id="${escapeHtml(def.id)}">Edit</button>
+          ${isUserCreated ? `<button class="pdef-delete-btn text-xs px-2 py-1 text-red-600 hover:bg-red-50 rounded" data-id="${escapeHtml(def.id)}">Delete</button>` : ''}
+          ${isCustomized ? `<button class="pdef-reset-btn text-xs px-2 py-1 text-amber-600 hover:bg-amber-50 rounded" data-id="${escapeHtml(def.id)}">Reset</button>` : ''}
         </div>
       `;
       list.appendChild(row);

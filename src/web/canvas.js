@@ -1090,7 +1090,8 @@ export class CanvasRenderer {
   renderImageElement(element, width, height) {
     const { imageData } = element;
 
-    if (!imageData) return;
+    // Only embedded images; never let a design point the browser at a remote URL.
+    if (typeof imageData !== 'string' || !imageData.startsWith('data:image/')) return;
 
     // Get or create cached image (using LRU getter)
     let img = this._getFromImageCache(element.id);
@@ -1682,7 +1683,8 @@ export class CanvasRenderer {
 
       reader.onload = async (e) => {
         try {
-          const pdf = await window.pdfjsLib.getDocument({ data: e.target.result }).promise;
+          // isEvalSupported: false keeps pdf.js from compiling font data into code (CVE-2024-4367).
+          const pdf = await window.pdfjsLib.getDocument({ data: e.target.result, isEvalSupported: false }).promise;
           const page = await pdf.getPage(1);
 
           // Render at 2x scale for quality (PDF default is 72 DPI, so 2x ≈ 144 DPI)
