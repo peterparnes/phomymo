@@ -5,8 +5,9 @@
  */
 
 import { CanvasRenderer } from './canvas.js?v=116';
-import { BLETransport } from './ble.js?v=103';
-import { USBTransport } from './usb.js?v=101';
+import { BLETransport } from './ble.js?v=104';
+import { USBTransport } from './usb.js?v=102';
+import { sleep, whileHoldingPrintLock } from './utils/timers.js';
 import { print, printDensityTest, isDSeriesPrinter, isP12Printer, isA30Printer, isTapePrinter, isPM241Printer, isTSPLPrinter, isRotatedPrinter, getPrinterWidthBytes, getPrinterDpi, getPrinterAlignment, getPrinterDescription, isDeviceRecognized, getMatchedPattern, loadPrinterDefinitions, getAllPrinterDefinitions, getPrinterDefinition, getCustomPrinterDefinitions, saveCustomPrinterDefinition, deleteCustomPrinterDefinition, isBuiltinPrinter, resetBuiltinPrinter, getAvailableProtocols, getAvailableLabelPresets, getDetectedDefinition } from './printer.js?v=128';
 import {
   generateId,
@@ -141,7 +142,7 @@ let LABEL_SIZES = { ...M_SERIES_LABEL_SIZES, ...M_SERIES_ROUND_LABELS };
 
 // App state
 const state = {
-  connectionType: 'ble',
+  connectionType: 'usb',  // default; falls back to Bluetooth where WebUSB is missing
   labelSize: { width: 40, height: 30 },
   tapeWidth: 12,  // Tape width in mm for tape printers (P12/A30), default 12mm
   elements: [],
@@ -588,25 +589,37 @@ let printProgressCancelled = false;
 /**
  * Show print progress modal
  */
+let titleBeforePrint = null;
+
 function showPrintProgress(title, total) {
   printProgressCancelled = false;
   const modal = $('#print-progress-modal');
   $('#progress-title').textContent = title;
   $('#progress-subtitle').textContent = 'Preparing...';
   $('#progress-bar').style.width = '0%';
-  $('#progress-detail').textContent = `0 of ${total}`;
+  $('#progress-detail').textContent = `0 of ${total} · ${total} left`;
+  $('#progress-cancel').disabled = false;
+  $('#progress-cancel').textContent = 'Stop printing';
   modal.classList.remove('hidden');
   modal.classList.add('flex');
+  if (titleBeforePrint === null) titleBeforePrint = document.title;
+  document.title = `(${total} left) ${titleBeforePrint}`;
 }
 
 /**
  * Update print progress
  */
 function updatePrintProgress(current, total, sublabel = '') {
-  const percent = Math.round((current / total) * 100);
+  // "left" counts the label being printed now, so it reaches 0 only when everything is done.
+  const left = Math.max(0, total - current + 1);
+  const percent = Math.round(((current - 1) / total) * 100);
   $('#progress-bar').style.width = `${percent}%`;
-  $('#progress-detail').textContent = `${current} of ${total}`;
-  $('#progress-subtitle').textContent = sublabel || `Printing label ${current}...`;
+  $('#progress-detail').textContent = `${current} of ${total} · ${left} left`;
+  if (!printProgressCancelled) {
+    $('#progress-subtitle').textContent = sublabel || `Printing label ${current}...`;
+  }
+  // Also visible on the browser tab while the page is in the background.
+  if (titleBeforePrint !== null) document.title = `(${left} left) ${titleBeforePrint}`;
 }
 
 /**
@@ -616,6 +629,10 @@ function hidePrintProgress() {
   const modal = $('#print-progress-modal');
   modal.classList.add('hidden');
   modal.classList.remove('flex');
+  if (titleBeforePrint !== null) {
+    document.title = titleBeforePrint;
+    titleBeforePrint = null;
+  }
 }
 
 /**
@@ -1972,6 +1989,7 @@ async function handleBatchPrint() {
       : `Printing ${totalRecords} Label${totalRecords !== 1 ? 's' : ''}`;
     showPrintProgress(labelText, totalRows);
 
+    await whileHoldingPrintLock(async () => {
     for (let rowIndex = 0; rowIndex < totalRows; rowIndex++) {
       // Check for cancellation
       if (isPrintCancelled()) {
@@ -2039,9 +2057,10 @@ async function handleBatchPrint() {
       // Delay between prints
       if (rowIndex < totalRows - 1 && !isPrintCancelled()) {
         updatePrintProgress(rowIndex + 1, totalRows, 'Waiting...');
-        await new Promise(r => setTimeout(r, 500));
+        await sleep(500);
       }
     }
+    });
 
     if (!isPrintCancelled()) {
       const successMsg = isMultiLabel && !cloneMode
@@ -4851,31 +4870,48 @@ async function handlePrint() {
       ? state.renderer.getRasterDataRaw(elementsToRender, ditherMode)
       : state.renderer.getRasterData(elementsToRender, printerWidth, printerDpi, ditherMode, printerAlignment);
 
-    // Print multiple copies if requested
-    for (let copy = 1; copy <= copies; copy++) {
-      const copyText = copies > 1 ? ` (${copy}/${copies})` : '';
-      setStatus(`Printing${copyText}...`);
+    // Several copies get the progress window with a count of what is left and a stop button.
+    const multiple = copies > 1;
+    printProgressCancelled = false;  // a stopped earlier run must not stop this one
+    if (multiple) showPrintProgress(`Printing ${copies} copies`, copies);
 
-      await print(state.transport, rasterData, {
-        isBLE: state.connectionType === 'ble',
-        deviceName,
-        printerModel,
-        density,
-        feed,
-        continuous: !!(state.labelSize?.continuous),
-        onProgress: (progress) => {
-          btn.textContent = `Printing... ${progress}%`;
-          setStatus(`Printing${copyText}... ${progress}%`);
-        },
-      });
+    let printed = 0;
+    await whileHoldingPrintLock(async () => {
+      for (let copy = 1; copy <= copies; copy++) {
+        if (isPrintCancelled()) break;
+        const copyText = multiple ? ` (${copy}/${copies})` : '';
+        setStatus(`Printing${copyText}...`);
+        if (multiple) updatePrintProgress(copy, copies, `Printing copy ${copy}...`);
 
-      // Small delay between copies
-      if (copy < copies) {
-        await new Promise(r => setTimeout(r, 500));
+        await print(state.transport, rasterData, {
+          isBLE: state.connectionType === 'ble',
+          deviceName,
+          printerModel,
+          density,
+          feed,
+          continuous: !!(state.labelSize?.continuous),
+          onProgress: (progress) => {
+            btn.textContent = `Printing... ${progress}%`;
+            setStatus(`Printing${copyText}... ${progress}%`);
+            if (multiple) updatePrintProgress(copy, copies, `Sending copy ${copy}... ${progress}%`);
+          },
+        });
+        printed = copy;
+
+        // Small delay between copies (worker timer: keeps going in a background tab)
+        if (copy < copies && !isPrintCancelled()) {
+          await sleep(500);
+        }
       }
-    }
+    });
 
-    setStatus(copies > 1 ? `Printed ${copies} copies!` : 'Print complete!');
+    if (multiple && printed < copies) {
+      const msg = `Printing stopped after ${printed} of ${copies} copies`;
+      showToast(msg, 'warning');
+      setStatus(msg);
+    } else {
+      setStatus(multiple ? `Printed ${copies} copies!` : 'Print complete!');
+    }
     btn.textContent = 'Print';
 
   } catch (error) {
@@ -4884,6 +4920,7 @@ async function handlePrint() {
     btn.textContent = originalText;
   } finally {
     btn.disabled = false;
+    hidePrintProgress();
   }
 }
 
@@ -4914,8 +4951,10 @@ function shouldShowInfoOnLoad() {
  */
 function showSaveDialog() {
   $('#save-dialog').classList.remove('hidden');
-  $('#save-name').value = '';
+  // Suggest the name of the design that was loaded (or last saved); a new design starts empty.
+  $('#save-name').value = state.currentDesignName || '';
   $('#save-name').focus();
+  $('#save-name').select();
 }
 
 /**
@@ -7202,7 +7241,11 @@ function init() {
   if (!('usb' in navigator)) {
     const usbOption = connType.querySelector('option[value="usb"]');
     if (usbOption) usbOption.remove();
+    $('#mobile-conn-type')?.querySelector('option[value="usb"]')?.remove();
   }
+  // USB is the default; without WebUSB the select falls back to Bluetooth.
+  state.connectionType = connType.value;
+  if ($('#mobile-conn-type')) $('#mobile-conn-type').value = connType.value;
   connType.addEventListener('change', (e) => {
     state.connectionType = e.target.value;
     const btn = $('#connect-btn');
@@ -7591,7 +7634,9 @@ function init() {
   // Print progress cancel button
   $('#progress-cancel').addEventListener('click', () => {
     printProgressCancelled = true;
-    $('#progress-subtitle').textContent = 'Cancelling...';
+    $('#progress-cancel').disabled = true;
+    $('#progress-cancel').textContent = 'Stopping...';
+    $('#progress-subtitle').textContent = 'Stopping after the current label...';
   });
 
   // Elements dropdown

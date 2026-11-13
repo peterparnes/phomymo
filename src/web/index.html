@@ -420,7 +420,7 @@
         <div class="flex items-center gap-1 sm:gap-2 text-sm">
           <select id="conn-type" class="hidden sm:block px-2 py-1.5 border border-gray-300 rounded-lg bg-white focus:outline-none text-xs sm:text-sm">
             <option value="ble">Bluetooth</option>
-            <option value="usb">USB</option>
+            <option value="usb" selected>USB</option>
           </select>
           <button id="connect-btn" class="px-2 sm:px-3 py-1 sm:py-1.5 border border-gray-300 rounded-lg bg-white hover:bg-gray-50 text-xs sm:text-sm font-medium transition-colors">
             Connect
@@ -1922,7 +1922,7 @@
             </button>
             <select id="mobile-conn-type" class="px-3 py-2 border border-gray-200 rounded-lg text-sm">
               <option value="ble">BT</option>
-              <option value="usb">USB</option>
+              <option value="usb" selected>USB</option>
             </select>
           </div>
         </div>
@@ -2143,7 +2143,7 @@
     pdfjsModule.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.mjs';
     window.pdfjsLib = pdfjsModule;
   </script>
-  <script type="module" src="app.js?v=152"></script>
+  <script type="module" src="app.js?v=153"></script>
   <script>
     // Show body once styles are ready
     requestAnimationFrame(() => {
