@@ -2,6 +2,8 @@
  * WebUSB transport for Phomymo
  */
 
+import { sleep } from './utils/timers.js';
+
 // Known USB IDs for Phomemo printers
 const USB_DEVICE_FILTERS = [
   // Standard Phomemo printers (M110, M220, etc.)
@@ -214,7 +216,7 @@ export class USBTransport {
    * Delay helper
    */
   delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    return sleep(ms); // keeps running in a background tab
   }
 
   /**

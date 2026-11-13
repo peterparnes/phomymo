@@ -9,6 +9,7 @@
  */
 
 import { BLE } from './constants.js';
+import { sleep } from './utils/timers.js';
 
 // Printer query commands (format: [0x1F, 0x11, X])
 const QUERY_COMMANDS = {
@@ -440,7 +441,7 @@ export class BLETransport {
    * Delay helper
    */
   delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    return sleep(ms); // keeps running in a background tab
   }
 
   /**
