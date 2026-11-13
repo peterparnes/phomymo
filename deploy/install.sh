@@ -2,8 +2,10 @@
 # Publishes Pho (Phomymo) on Apache at https://phomymo.parnes.com.
 set -Eeuo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="${REPO_DIR:-$(dirname "$HERE")}"
+REPO_DIR="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# build.sh and apache.conf come from the checkout, not from beside this script: the server
+# dashboard runs a root-owned copy of it from elsewhere, with REPO_DIR set to the checkout.
+HERE="$REPO_DIR/deploy"
 PUBLIC_HOST="${PUBLIC_HOST:-phomymo.parnes.com}"
 DOCUMENT_ROOT="${DOCUMENT_ROOT:-/local/1/httpd/$PUBLIC_HOST}"
 SITE_FILE="${SITE_FILE:-/etc/apache2/sites-available/$PUBLIC_HOST.conf}"
